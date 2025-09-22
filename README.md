@@ -1,0 +1,1 @@
+# seccom-azureadscript
