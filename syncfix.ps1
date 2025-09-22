@@ -1,5 +1,5 @@
 <#
-.PURPOSE
+.SYNOPSIS
     Sync selected user attributes from on-prem AD to Entra ID (Microsoft Graph),
     report Exchange Online Archive status, and write Archive GUID back to on-prem AD.
 
