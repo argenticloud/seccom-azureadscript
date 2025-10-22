@@ -6,8 +6,7 @@
 .DESCRIPTION
     - Reads attributes from local AD (Get-ADUser)
     - Reads user from Entra ID (Get-MgUser)
-    - Compares per an attribute map and builds a PATCH payload
-    - Writes via Update-MgUser when differences exist (unless DryRun)
+    - Compares attributes and proposes AD updates interactively
     - Connects to Exchange Online to fetch Archive mailbox info (status, GUID, name)
     - Writes back EXO ArchiveGuid -> AD msExchArchiveGuid (binary) and ArchiveName -> msExchArchiveName
       (writeback occurs when -DryRun:$false)
@@ -17,9 +16,6 @@
 
 .PARAMETER DryRun
     When set, no updates are sent to Entra ID nor AD (report-only). (Default: On)
-
-.PARAMETER ForceCloudWrite
-    Allows writes to Graph even if user is dirsync’ed (OnPremisesSyncEnabled=$true). Use with caution.
 
 .PARAMETER WritebackArchive
     When set (default), evaluate archive writeback logic. With -DryRun:$false it will update AD.
@@ -44,8 +40,8 @@ param (
     [string]$Target,
 
     [switch]$DryRun = $true,
-    [switch]$ForceCloudWrite,
-    [switch]$WritebackArchive = $true
+    [switch]$WritebackArchive = $true,
+    [switch]$PromptForChanges = $true
 )
 
 # --- Modules & Auth ---
@@ -57,10 +53,10 @@ Import-Module ActiveDirectory -ErrorAction Stop
 Import-Module Microsoft.Graph.Users -ErrorAction Stop
 Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
-# Connect to Microsoft Graph (if not already connected)
+# Connect to Microsoft Graph (if not already connected) - read-only scope
 try {
     if (-not (Get-MgContext)) {
-        Connect-MgGraph -Scopes 'User.ReadWrite.All','Directory.Read.All' | Out-Null
+        Connect-MgGraph -Scopes 'User.Read.All','Directory.Read.All' | Out-Null
     }
 } catch {
     Write-Error "Failed to connect to Microsoft Graph: $($_.Exception.Message)"
@@ -94,8 +90,8 @@ $AttributeMap = @{
     'physicalDeliveryOfficeName'   = @{ Graph='officeLocation';               Writable=$true }
 
     # Contact
-    'mobile'                       = @{ Graph='mobilePhone';                  Writable=$true }
-    'telephoneNumber'              = @{ Graph='businessPhones';               Writable=$true; Transform = { param($v) if ([string]::IsNullOrWhiteSpace($v)) { @() } else { @("$v") } } }
+    'mobile'                       = @{ Graph='mobilePhone';                  Writable=$true; ReverseTransform = { param($gv) if ([string]::IsNullOrWhiteSpace($gv)) { $null } else { "$gv" } } }
+    'telephoneNumber'              = @{ Graph='businessPhones';               Writable=$true; Transform = { param($v) if ([string]::IsNullOrWhiteSpace($v)) { @() } else { @("$v") } }; ReverseTransform = { param($gv) if ($gv -is [System.Collections.IEnumerable] -and -not ($gv -is [string])) { ($gv | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -First 1) } elseif ([string]::IsNullOrWhiteSpace($gv)) { $null } else { "$gv" } } }
     'streetAddress'                = @{ Graph='streetAddress';                Writable=$true }
     'l'                            = @{ Graph='city';                         Writable=$true }              # AD l (locality) -> Graph city
     'st'                           = @{ Graph='state';                        Writable=$true }              # AD st -> Graph state
@@ -126,12 +122,12 @@ $AttributeMap = @{
 # Helper: AD properties to retrieve (include archive attributes)
 $AdPropsToGet = (@('UserPrincipalName','DistinguishedName','msExchArchiveGuid','msExchArchiveName') + $AttributeMap.Keys | Sort-Object -Unique)
 
-# Graph properties to select
+# Graph properties to select (read-only)
 $GraphPropsToSelect = @(
     'Id','UserPrincipalName','DisplayName','GivenName','Surname',
     'Department','JobTitle','Mail','MobilePhone','BusinessPhones','OfficeLocation',
     'City','State','PostalCode','Country','StreetAddress',
-    'OnPremisesSyncEnabled','OnPremisesExtensionAttributes'
+    'OnPremisesExtensionAttributes'
 )
 
 function Get-GraphPropertyValue {
@@ -201,6 +197,80 @@ function Build-PatchObject { param([Parameter(Mandatory=$true)]$AdUser,[Paramete
     [PSCustomObject]@{ PatchObject=$patch; Changes=$changes }
 }
 
+# Build a plan of AD updates using Graph as the source-of-truth for mapped attributes
+function Build-AdUpdatePlan {
+    param(
+        [Parameter(Mandatory=$true)][Microsoft.ActiveDirectory.Management.ADUser]$AdUser,
+        [Parameter(Mandatory=$true)]$GraphUser
+    )
+    $plan = @()
+    foreach ($adName in $AttributeMap.Keys) {
+        $map = $AttributeMap[$adName]
+        $graphPath = $map.Graph
+        $graphValRaw = Get-GraphPropertyValue -GraphUser $GraphUser -GraphPath $graphPath
+        $graphValNorm = Normalize-Value $graphValRaw
+        $desiredAd = $graphValNorm
+        if ($map.ContainsKey('ReverseTransform') -and $null -ne $map.ReverseTransform) {
+            $desiredAd = & $map.ReverseTransform $graphValNorm
+        }
+        $adCurrent = $AdUser.$adName
+        if (-not (Equal-Values $adCurrent $desiredAd)) {
+            $plan += [PSCustomObject]@{
+                AdAttribute   = $adName
+                GraphProperty = $graphPath
+                AdCurrent     = $adCurrent
+                EntraValue    = $graphValNorm
+                AdDesired     = $desiredAd
+            }
+        }
+    }
+    return ,$plan
+}
+
+function Apply-AdUpdatesWithPrompt {
+    param(
+        [Parameter(Mandatory=$true)][Microsoft.ActiveDirectory.Management.ADUser]$AdUser,
+        [Parameter(Mandatory=$true)][object[]]$Plan,
+        [switch]$DoWrite,
+        [switch]$Prompt
+    )
+    $applied = @()
+    foreach ($chg in $Plan) {
+        $entraDispl = ($chg.EntraValue | ConvertTo-Json -Compress -Depth 6)
+        $adDispl    = ($chg.AdCurrent  | ConvertTo-Json -Compress -Depth 6)
+        $msg = "User $($AdUser.UserPrincipalName) has entra $($chg.GraphProperty) of $entraDispl and ad $($chg.AdAttribute) of $adDispl. Update local AD? y/n"
+        $doIt = $false
+        if ($Prompt) {
+            $answer = Read-Host $msg
+            if ($answer -match '^[Yy]') { $doIt = $true }
+        } else {
+            $doIt = $true
+        }
+        if ($doIt) {
+            if ($DoWrite) {
+                try {
+                    if ($null -eq $chg.AdDesired -or ("$($chg.AdDesired)".Trim() -eq '')) {
+                        Set-ADUser -Identity $AdUser.DistinguishedName -Clear $chg.AdAttribute -ErrorAction Stop
+                    } else {
+                        try {
+                            Set-ADUser -Identity $AdUser.DistinguishedName -Replace @{ ($chg.AdAttribute) = $chg.AdDesired } -ErrorAction Stop
+                        } catch {
+                            Set-ADUser -Identity $AdUser.DistinguishedName -Add @{ ($chg.AdAttribute) = $chg.AdDesired } -ErrorAction Stop
+                        }
+                    }
+                    $applied += $chg
+                } catch {
+                    Write-Warning "Failed to update AD attribute $($chg.AdAttribute) for $($AdUser.UserPrincipalName): $($_.Exception.Message)"
+                }
+            } else {
+                # Dry run: treat as applied for reporting purposes
+                $applied += $chg
+            }
+        }
+    }
+    return ,$applied
+}
+
 # --- Archive GUID helpers ---
 function Convert-GuidStringToByteArray {
     param([Parameter(Mandatory=$true)][string]$GuidString)
@@ -233,7 +303,8 @@ function Writeback-ArchiveToAD {
     param(
         [Parameter(Mandatory=$true)][Microsoft.ActiveDirectory.Management.ADUser]$AdUser,
         [Parameter(Mandatory=$true)]$ExoMailbox,
-        [switch]$DoWrite
+        [switch]$DoWrite,
+        [switch]$Prompt
     )
     $wb = [ordered]@{
         Attempted             = [bool]$DoWrite
@@ -295,6 +366,13 @@ function Writeback-ArchiveToAD {
 
     # Perform updates
     try {
+        if ($Prompt) {
+            $displayGuidBefore = $wb.AdArchiveGuidBefore
+            $displayGuidAfter  = Convert-ByteArrayToGuidString -Bytes $desiredGuidBytes
+            $promptMsg = "User $($AdUser.UserPrincipalName) has entra OnlineArchive of $($wb.ArchiveStatus) (Guid $displayGuidAfter) and ad msExchArchiveGuid of $displayGuidBefore. Update local AD? y/n"
+            $ans = Read-Host $promptMsg
+            if ($ans -notmatch '^[Yy]') { $wb.Action = 'SkippedByUser'; return [PSCustomObject]$wb }
+        }
         $replace = @{}
         if ($guidNeedsUpdate) { $replace['msExchArchiveGuid'] = $desiredGuidBytes }
         if ($nameNeedsUpdate) { $replace['msExchArchiveName'] = $desiredName }
@@ -377,27 +455,17 @@ function Sync-User {
         }
     }
 
-    $dirsync = $false
-    try { $dirsync = [bool]$graphUser.OnPremisesSyncEnabled } catch {}
+    $dirsync = $null
 
-    # --- Build Graph patch ---
+    # --- Build change summary (read-only) ---
     $result   = Build-PatchObject -AdUser $adUser -GraphUser $graphUser
     $patch    = $result.PatchObject
     $changes  = $result.Changes
     $wChanges = $changes | Where-Object { $_.Writable -eq $true }
 
-    $attemptWriteGraph = $wChanges.Count -gt 0 -and (-not $DryRun)
-    if ($dirsync -and $attemptWriteGraph -and -not $ForceCloudWrite) {
-        $attemptWriteGraph = $false
-        $errors.Add("User is OnPremisesSyncEnabled; skipped Graph writes (report-only). Use -ForceCloudWrite to override.") | Out-Null
-    }
-    if ($attemptWriteGraph) {
-        try {
-            if ($patch.Keys.Count -gt 0) {
-                Update-MgUser -UserId $graphUser.Id -BodyParameter $patch -ErrorAction Stop
-            }
-        } catch { $errors.Add("Graph update failed: $($_.Exception.Message)") | Out-Null }
-    }
+    # --- Graph -> AD interactive writeback for mapped attributes ---
+    $adPlan = Build-AdUpdatePlan -AdUser $adUser -GraphUser $graphUser
+    $adApplied = Apply-AdUpdatesWithPrompt -AdUser $adUser -Plan $adPlan -DoWrite:(!$DryRun) -Prompt:$PromptForChanges
 
     # --- Exchange Online: Archive status ---
     $archiveEnabled = $null
@@ -420,7 +488,7 @@ function Sync-User {
     # --- Archive writeback to AD ---
     $wbDetails = [PSCustomObject]@{ }
     if ($WritebackArchive) {
-        $wbDetails = Writeback-ArchiveToAD -AdUser $adUser -ExoMailbox $exoMailbox -DoWrite:(!$DryRun)
+        $wbDetails = Writeback-ArchiveToAD -AdUser $adUser -ExoMailbox $exoMailbox -DoWrite:(!$DryRun) -Prompt:$PromptForChanges
     } else {
         $wbDetails = [PSCustomObject]@{ Attempted=$false; Action='Skipped'; Error=''; ArchiveStatus=$archiveStatus; ExoArchiveGuidString=$archiveGuidStr; AdArchiveGuidBefore=(Convert-ByteArrayToGuidString -Bytes $adUser.'msExchArchiveGuid'); AdArchiveGuidAfter=$null; AdArchiveNameBefore=$adUser.'msExchArchiveName'; AdArchiveNameAfter=$null }
     }
@@ -430,12 +498,13 @@ function Sync-User {
         UserPrincipalName       = $Upn
         DirsyncUser             = $dirsync
         DryRun                  = [bool]$DryRun
-        ForceCloudWrite         = [bool]$ForceCloudWrite
-        ActionTaken             = if ($wChanges.Count -eq 0) { 'NoChange' } elseif ($attemptWriteGraph) { 'GraphUpdated' } else { 'GraphReportedOnly' }
+        ActionTaken             = if ($wChanges.Count -eq 0) { 'NoChange' } else { 'ReportedOnly' }
         ChangeCount             = $changes.Count
         WritableChangeCount     = $wChanges.Count
         ChangesJson             = ($changes | ConvertTo-Json -Compress -Depth 6)
         PatchJson               = ($patch   | ConvertTo-Json -Compress -Depth 6)
+        AdPlannedChanges        = ($adPlan | ConvertTo-Json -Compress -Depth 6)
+        AdAppliedChanges        = ($adApplied | ConvertTo-Json -Compress -Depth 6)
         ArchiveMailboxEnabled   = $archiveEnabled
         ArchiveStatus           = $archiveStatus
         ArchiveGuid             = $archiveGuidStr
