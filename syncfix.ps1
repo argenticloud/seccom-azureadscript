@@ -25,7 +25,7 @@
       - ActiveDirectory module (for local AD)
       - Microsoft.Graph.Users module (Install-Module Microsoft.Graph -Scope CurrentUser)
       - ExchangeOnlineManagement module (Install-Module ExchangeOnlineManagement -Scope CurrentUser)
-    Connects to Graph with scopes: User.ReadWrite.All, Directory.Read.All
+    Connects to Graph with scopes: User.Read.All, Directory.Read.All
     Connects to Exchange Online via Connect-ExchangeOnline
 
     AD REQUIREMENTS:
@@ -408,14 +408,14 @@ function Sync-User {
     $errors = New-Object System.Collections.Generic.List[string]
 
     # --- Get local AD user ---
-    $adUser = Get-ADUser -Filter "UserPrincipalName -eq '$Upn'" -Properties $AdPropsToGet -ErrorAction SilentlyContinue
+    $safeUpn = $Upn -replace "'","''"
+    $adUser = Get-ADUser -Filter "UserPrincipalName -eq '$safeUpn'" -Properties $AdPropsToGet -ErrorAction SilentlyContinue
     if (-not $adUser) {
         Write-Warning "AD user not found: $Upn"
         return [PSCustomObject]@{
             UserPrincipalName     = $Upn
             DirsyncUser           = $null
             DryRun                = [bool]$DryRun
-            ForceCloudWrite       = [bool]$ForceCloudWrite
             ActionTaken           = 'NotFound-AD'
             ChangeCount           = 0
             WritableChangeCount   = 0
@@ -432,26 +432,30 @@ function Sync-User {
 
     # --- Get Graph user ---
     $graphUser = $null
-    try { $graphUser = Get-MgUser -UserId $Upn -Property $GraphPropsToSelect -ErrorAction Stop }
-    catch {
-        $msg = "Graph user not found or inaccessible: $Upn - $($_.Exception.Message)"
-        Write-Warning $msg
-        return [PSCustomObject]@{
-            UserPrincipalName     = $Upn
-            DirsyncUser           = $null
-            DryRun                = [bool]$DryRun
-            ForceCloudWrite       = [bool]$ForceCloudWrite
-            ActionTaken           = 'NotFound-Graph'
-            ChangeCount           = 0
-            WritableChangeCount   = 0
-            ChangesJson           = '[]'
-            PatchJson             = '{}'
-            ArchiveMailboxEnabled = $null
-            ArchiveStatus         = 'Unknown'
-            ArchiveGuid           = ''
-            ArchiveName           = ''
-            ArchiveWritebackJson  = '{}'
-            Error                 = $msg
+    try {
+        $graphUser = Get-MgUser -UserId $Upn -Property $GraphPropsToSelect -ErrorAction Stop
+    } catch {
+        try {
+            $graphUser = Get-MgUser -UserId $Upn -Select ($GraphPropsToSelect -join ',') -ErrorAction Stop
+        } catch {
+            $msg = "Graph user not found or inaccessible: $Upn - $($_.Exception.Message)"
+            Write-Warning $msg
+            return [PSCustomObject]@{
+                UserPrincipalName     = $Upn
+                DirsyncUser           = $null
+                DryRun                = [bool]$DryRun
+                ActionTaken           = 'NotFound-Graph'
+                ChangeCount           = 0
+                WritableChangeCount   = 0
+                ChangesJson           = '[]'
+                PatchJson             = '{}'
+                ArchiveMailboxEnabled = $null
+                ArchiveStatus         = 'Unknown'
+                ArchiveGuid           = ''
+                ArchiveName           = ''
+                ArchiveWritebackJson  = '{}'
+                Error                 = $msg
+            }
         }
     }
 
